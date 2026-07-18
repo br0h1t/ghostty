@@ -219,6 +219,7 @@
 				"Ghostty/Surface View/SurfaceDragSource.swift",
 				"Ghostty/Surface View/SurfaceGrabHandle.swift",
 				"Ghostty/Surface View/SurfaceScrollView.swift",
+				"Ghostty/Surface View/SurfaceView+DnD.swift",
 				"Ghostty/Surface View/SurfaceView_AppKit.swift",
 				Helpers/AppInfo.swift,
 				Helpers/CodableBridge.swift,

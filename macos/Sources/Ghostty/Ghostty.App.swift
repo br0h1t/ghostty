@@ -66,7 +66,8 @@ extension Ghostty {
                 confirm_read_clipboard_cb: { userdata, str, state, request in App.confirmReadClipboard(userdata, string: str, state: state, request: request ) },
                 write_clipboard_cb: { userdata, loc, content, len, confirm in
                     App.writeClipboard(userdata, location: loc, content: content, len: len, confirm: confirm) },
-                close_surface_cb: { userdata, processAlive in App.closeSurface(userdata, processAlive: processAlive) }
+                close_surface_cb: { userdata, processAlive in App.closeSurface(userdata, processAlive: processAlive) },
+                dnd_cb: { userdata, event in App.dnd(userdata, event: event) }
             )
 
             // Create the ghostty app.
@@ -295,6 +296,7 @@ extension Ghostty {
         ) {}
 
         static func closeSurface(_ userdata: UnsafeMutableRawPointer?, processAlive: Bool) {}
+        static func dnd(_ userdata: UnsafeMutableRawPointer?, event: UnsafePointer<ghostty_dnd_event_s>?) {}
         #endif
 
         #if os(macOS)
@@ -429,6 +431,41 @@ extension Ghostty {
                     Notification.ConfirmClipboardRequestKey: Ghostty.ClipboardRequest.osc_52_write(pasteboard),
                 ]
             )
+        }
+
+        /// Dispatches an inbound Kitty drag-and-drop (OSC 72) event to the surface that sent it.
+        static func dnd(_ userdata: UnsafeMutableRawPointer?, event: UnsafePointer<ghostty_dnd_event_s>?) {
+            guard let event else { return }
+            let surfaceView = self.surfaceUserdata(from: userdata)
+            let payload = event.pointee
+
+            switch payload.tag {
+            case GHOSTTY_DND_ACCEPT:
+                let accept = payload.event.accept
+                surfaceView.dndAccept(
+                    mimes: dndString(accept.mimes, count: accept.mimes_len),
+                    session: accept.session)
+
+            case GHOSTTY_DND_SET_OPERATION:
+                let op = payload.event.set_operation
+                surfaceView.dndSetOperation(
+                    operation: op.operation,
+                    mimes: dndString(op.mimes, count: op.mimes_len))
+
+            case GHOSTTY_DND_STOP:
+                surfaceView.dndStop()
+
+            case GHOSTTY_DND_REQUEST_DATA:
+                let req = payload.event.request_data
+                surfaceView.dndRequestData(mimeIndex: req.mime_index)
+
+            case GHOSTTY_DND_FINISH:
+                let finish = payload.event.finish
+                surfaceView.dndFinish(operation: finish.operation)
+
+            default:
+                Ghostty.logger.warning("unknown dnd event tag=\(payload.tag.rawValue, privacy: .public)")
+            }
         }
 
         static func wakeup(_ userdata: UnsafeMutableRawPointer?) {

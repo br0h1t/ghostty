@@ -3,6 +3,9 @@ import GhosttyKit
 import UniformTypeIdentifiers
 
 extension NSPasteboard.PasteboardType {
+    /// A reversible UTI namespace for MIME types that do not have a system `UTType`
+    private static let ghosttyMimePrefix = "com.mitchellh.ghostty.mime."
+
     /// Initialize a pasteboard type from a MIME type string
     init?(mimeType: String) {
         // Explicit mappings for common MIME types
@@ -23,6 +26,60 @@ extension NSPasteboard.PasteboardType {
 
         // Use the UTType's identifier
         self.init(utType.identifier)
+    }
+
+    /// Initialize a DnD pasteboard type, using a reversible synthetic UTI for
+    /// private MIME types that UniformTypeIdentifiers does not recognize.
+    init?(dndMimeType mimeType: String) {
+        guard !mimeType.isEmpty else { return nil }
+        if mimeType == "text/plain" || UTType(mimeType: mimeType) != nil {
+            self.init(mimeType: mimeType)
+            return
+        }
+
+        guard let data = mimeType.data(using: .utf8) else { return nil }
+        let encoded = data.map { String(format: "%02x", $0) }.joined()
+        self.init(Self.ghosttyMimePrefix + encoded)
+    }
+
+    /// The MIME type for a DnD pasteboard type
+    var dndMimeType: String? {
+        guard rawValue.hasPrefix(Self.ghosttyMimePrefix) else { return mimeType }
+        let encoded = rawValue.dropFirst(Self.ghosttyMimePrefix.count)
+        guard !encoded.isEmpty, encoded.count.isMultiple(of: 2) else { return nil }
+
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(encoded.count / 2)
+        var offset = encoded.startIndex
+        while offset < encoded.endIndex {
+            let end = encoded.index(offset, offsetBy: 2)
+            guard let byte = UInt8(encoded[offset..<end], radix: 16) else { return nil }
+            bytes.append(byte)
+            offset = end
+        }
+        return String(bytes: bytes, encoding: .utf8)
+    }
+
+    /// The best-effort MIME type for this pasteboard type.
+    var mimeType: String? {
+        switch self {
+        case .string:
+            return "text/plain"
+        case .fileURL:
+            return "text/uri-list"
+        default:
+            break
+        }
+
+        if let mime = UTType(self.rawValue)?.preferredMIMEType {
+            return mime
+        }
+
+        if let customUTType = UTType(tag: self.rawValue, tagClass: .mimeType, conformingTo: nil) {
+            return customUTType.preferredMIMEType
+        }
+
+        return nil
     }
 }
 

@@ -13,6 +13,7 @@ const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
 const global = @import("../global.zig");
 const input = @import("../input.zig");
+const kitty_dnd_format = @import("kitty_dnd_format.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
@@ -79,6 +80,9 @@ pub const App = struct {
 
         /// Close the current surface given by this function.
         close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
+
+        /// Handle an inbound Kitty drag-and-drop (OSC 72) event.
+        dnd: ?*const fn (SurfaceUD, *const CAPI.DndEvent) callconv(.c) void = null,
     };
 
     /// This is the key event sent for ghostty_surface_key and
@@ -982,10 +986,204 @@ pub const Surface = struct {
         return env;
     }
 
-    /// Handle an inbound Kitty drag-and-drop (OSC 72) event. The embedded
-    /// apprt does not yet implement native drag-and-drop; events are dropped.
-    /// The caller frees any owned payload on the message.
-    pub fn handleDnd(_: *Surface, _: apprt.surface.DndMessage) !void {}
+    /// Helper to convert representation from Zig to C (null -> -1)
+    fn dndSession(session: ?i32) i32 {
+        return session orelse -1;
+    }
+
+    /// Handle an inbound Kitty drag-and-drop (OSC 72) event by forwarding a
+    /// C-ABI event to the runtime's `dnd` callback.
+    pub fn handleDnd(self: *Surface, msg: apprt.surface.DndMessage) !void {
+        const dnd = self.app.opts.dnd orelse return;
+        switch (msg) {
+            .accept => |v| {
+                const mimes = v.mimes.slice();
+                const event: CAPI.DndEvent = .{ .tag = .accept, .event = .{
+                    .accept = .{
+                        .mimes = mimes.ptr,
+                        .mimes_len = mimes.len,
+                        .session = dndSession(v.session),
+                    },
+                } };
+                dnd(self.userdata, &event);
+            },
+
+            .set_operation => |v| {
+                const mimes = v.mimes.slice();
+                const event: CAPI.DndEvent = .{ .tag = .set_operation, .event = .{
+                    .set_operation = .{
+                        .mimes = mimes.ptr,
+                        .mimes_len = mimes.len,
+                        .operation = v.operation,
+                    },
+                } };
+                dnd(self.userdata, &event);
+            },
+
+            .stop => {
+                const event: CAPI.DndEvent = .{ .tag = .stop, .event = undefined };
+                dnd(self.userdata, &event);
+            },
+
+            .request_data => |v| {
+                const event: CAPI.DndEvent = .{ .tag = .request_data, .event = .{
+                    .request_data = .{ .mime_index = v.mime_index },
+                } };
+                dnd(self.userdata, &event);
+            },
+
+            .finish => |v| {
+                const event: CAPI.DndEvent = .{ .tag = .finish, .event = .{
+                    .finish = .{ .operation = v.operation },
+                } };
+                dnd(self.userdata, &event);
+            },
+        }
+    }
+
+    /// Converts a view point position to the scaled pixel and grid-cell
+    /// position the outbound Kitty drag-and-drop events report.
+    fn dndPosToCell(self: *Surface, x: f64, y: f64) !kitty_dnd_format.Position {
+        const px = try self.cursorPosToPixels(.{
+            .x = @floatCast(x),
+            .y = @floatCast(y),
+        });
+        const cell = self.core_surface.posToViewport(px.x, px.y);
+        return .{
+            .cell_x = @intCast(cell.x),
+            .cell_y = @intCast(cell.y),
+            .px_x = @intFromFloat(@round(px.x)),
+            .px_y = @intFromFloat(@round(px.y)),
+        };
+    }
+
+    fn sessionOrNull(session: i32) ?i32 {
+        return if (session >= 0) session else null;
+    }
+
+    /// Writes the OSC 72 bytes produced by a `kitty_dnd_format` call.
+    fn sendDnd(self: *Surface, formatted: anyerror![]u8) void {
+        const bytes = formatted catch |err| {
+            log.err("error formatting dnd event err={}", .{err});
+            return;
+        };
+        defer self.app.core_app.alloc.free(bytes);
+        self.core_surface.sendKittyDnd(bytes) catch |err| {
+            log.err("error sending dnd event err={}", .{err});
+        };
+    }
+
+    fn sendDndPayload(
+        self: *Surface,
+        session: ?i32,
+        metadata: []const u8,
+        raw: []const u8,
+        encoded: bool,
+    ) void {
+        const alloc = self.app.core_app.alloc;
+        const limit = kitty_dnd_format.maxChunkSize(encoded);
+
+        var offset: usize = 0;
+        while (offset < raw.len) {
+            const end = @min(offset + limit, raw.len);
+            const more = end < raw.len;
+            self.sendDnd(kitty_dnd_format.formatPayload(
+                alloc,
+                metadata,
+                more,
+                session,
+                raw[offset..end],
+                encoded,
+            ));
+            offset = end;
+        }
+    }
+
+    /// Sends an outbound `t=m`/`t=M` Kitty drag-and-drop event for a native
+    /// OS drag currently over this surface.
+    pub fn dndPointer(
+        self: *Surface,
+        kind: kitty_dnd_format.PointerKind,
+        session: ?i32,
+        x: f64,
+        y: f64,
+        ops: i32,
+        mimes: ?[]const u8,
+    ) void {
+        const pos = self.dndPosToCell(x, y) catch |err| {
+            log.err("error converting dnd position to pixels err={}", .{err});
+            return;
+        };
+        const has_payload = if (mimes) |m| m.len > 0 else false;
+
+        const metadata = kitty_dnd_format.formatPointer(
+            self.app.core_app.alloc,
+            kind,
+            pos,
+            ops,
+            session,
+            has_payload,
+        ) catch |err| {
+            log.err("error formatting dnd pointer metadata err={}", .{err});
+            return;
+        };
+
+        if (mimes) |m| {
+            if (m.len > 0) {
+                self.sendDndPayload(session, metadata, m, false);
+                return;
+            }
+        }
+        self.sendDnd(metadata);
+    }
+
+    /// Sends an outbound `t=m:x=-1:y=-1` event indicating a native drag left
+    /// this surface.
+    pub fn dndLeave(self: *Surface, session: ?i32) void {
+        self.sendDnd(kitty_dnd_format.formatLeave(
+            self.app.core_app.alloc,
+            session,
+        ));
+    }
+
+    /// Sends an outbound `t=r` data chunk for a drop data request.
+    pub fn dndData(self: *Surface, mime_index: i32, session: ?i32, data: []const u8) void {
+        if (data.len == 0) return;
+        const metadata = kitty_dnd_format.formatData(
+            self.app.core_app.alloc,
+            mime_index,
+        ) catch |err| {
+            log.err("error formatting dnd data metadata err={}", .{err});
+            return;
+        };
+        self.sendDndPayload(session, metadata, data, true);
+    }
+
+    /// Sends the empty `m=0` end-of-transfer frame for a drop data request.
+    pub fn dndDataEof(self: *Surface, mime_index: i32, session: ?i32) void {
+        self.sendDnd(kitty_dnd_format.formatDataEof(
+            self.app.core_app.alloc,
+            mime_index,
+            session,
+        ));
+    }
+
+    /// Sends an outbound `t=R` error response for a failed drop data request.
+    pub fn dndDataError(
+        self: *Surface,
+        mime_index: i32,
+        session: ?i32,
+        posix_name: []const u8,
+        desc: ?[]const u8,
+    ) void {
+        self.sendDnd(kitty_dnd_format.formatDataError(
+            self.app.core_app.alloc,
+            mime_index,
+            session,
+            posix_name,
+            desc,
+        ));
+    }
 
     /// The cursor position from the host directly is in screen coordinates but
     /// all our interface works in pixels.
@@ -1389,6 +1587,55 @@ pub const CAPI = struct {
                 .rectangle = self.rectangle,
             };
         }
+    };
+
+    // ghostty_dnd_event_tag_e
+    const DndEventTag = enum(c_int) {
+        accept = 0,
+        set_operation = 1,
+        stop = 2,
+        request_data = 3,
+        finish = 4,
+    };
+
+    // ghostty_dnd_accept_s
+    const DndAccept = extern struct {
+        mimes: [*]const u8,
+        mimes_len: usize,
+        session: i32,
+    };
+
+    // ghostty_dnd_set_operation_s
+    const DndSetOperation = extern struct {
+        /// Space-separated, ordered MIME types the application wants, in decreasing
+        /// order of preference. May be empty (implies "same as offered").
+        mimes: [*]const u8,
+        mimes_len: usize,
+        operation: i32,
+    };
+
+    // ghostty_dnd_request_data_s
+    const DndRequestData = extern struct {
+        mime_index: i32,
+    };
+
+    // ghostty_dnd_finish_s
+    const DndFinish = extern struct {
+        operation: i32,
+    };
+
+    // ghostty_dnd_event_u
+    const DndEventUnion = extern union {
+        accept: DndAccept,
+        set_operation: DndSetOperation,
+        request_data: DndRequestData,
+        finish: DndFinish,
+    };
+
+    // ghostty_dnd_event_s
+    pub const DndEvent = extern struct {
+        tag: DndEventTag,
+        event: DndEventUnion,
     };
 
     // Reference the conditional exports based on target platform
@@ -1995,6 +2242,94 @@ pub const CAPI = struct {
             std.mem.sliceTo(str, 0),
             state,
             confirmed,
+        );
+    }
+
+    // MARK: Kitty drag-and-drop (OSC 72)
+
+    /// Helper to convert representation from C to Zig (-1 -> null)
+    fn dndSession(session: i32) ?i32 {
+        return if (session >= 0) session else null;
+    }
+
+    /// A native drag entered the surface with an initial MIME type offer.
+    export fn ghostty_surface_dnd_enter(
+        surface: *Surface,
+        session: i32,
+        x: f64,
+        y: f64,
+        ops: i32,
+        mimes: [*:0]const u8,
+    ) void {
+        surface.dndPointer(.move, dndSession(session), x, y, ops, std.mem.span(mimes));
+    }
+
+    /// A native drag moved within the surface. `mimes` should be null
+    /// unless the offered MIME list changed since the last enter/move.
+    export fn ghostty_surface_dnd_move(
+        surface: *Surface,
+        session: i32,
+        x: f64,
+        y: f64,
+        ops: i32,
+        mimes: ?[*:0]const u8,
+    ) void {
+        surface.dndPointer(.move, dndSession(session), x, y, ops, std.mem.span(mimes));
+    }
+
+    /// A native drag left the surface without dropping.
+    export fn ghostty_surface_dnd_leave(surface: *Surface, session: i32) void {
+        surface.dndLeave(dndSession(session));
+    }
+
+    /// A native drag was dropped on the surface. `mimes` is the mandatory,
+    /// full list of MIME types available in the drop.
+    export fn ghostty_surface_dnd_drop(
+        surface: *Surface,
+        session: i32,
+        x: f64,
+        y: f64,
+        ops: i32,
+        mimes: [*:0]const u8,
+    ) void {
+        surface.dndPointer(.drop, dndSession(session), x, y, ops, std.mem.span(mimes));
+    }
+
+    /// Deliver a chunk of the data the application requested for a MIME type.
+    export fn ghostty_surface_dnd_data(
+        surface: *Surface,
+        mime_index: i32,
+        session: i32,
+        data: ?[*]const u8,
+        len: usize,
+    ) void {
+        const slice: []const u8 = if (data) |d| d[0..len] else &[_]u8{};
+        surface.dndData(mime_index, dndSession(session), slice);
+    }
+
+    /// Signal end of data for a MIME type previously sent with `dnd_data`.
+    export fn ghostty_surface_dnd_data_eof(
+        surface: *Surface,
+        mime_index: i32,
+        session: i32,
+    ) void {
+        surface.dndDataEof(mime_index, dndSession(session));
+    }
+
+    /// Report an error fetching the data for a MIME type.
+    /// `posix_name` must be a POSIX symbolic error name (e.g. "ENOENT").
+    export fn ghostty_surface_dnd_data_error(
+        surface: *Surface,
+        mime_index: i32,
+        session: i32,
+        posix_name: [*:0]const u8,
+        desc: ?[*:0]const u8,
+    ) void {
+        surface.dndDataError(
+            mime_index,
+            dndSession(session),
+            std.mem.span(posix_name),
+            std.mem.span(desc),
         );
     }
 
