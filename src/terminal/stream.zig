@@ -125,6 +125,7 @@ pub const Action = union(Key) {
     configure_charset: ConfigureCharset,
     set_attribute: sgr.Attribute,
     kitty_color_report: kitty.color.OSC,
+    kitty_dnd_protocol: osc.Command.KittyDndProtocol,
     color_operation: ColorOperation,
     semantic_prompt: SemanticPrompt,
 
@@ -224,6 +225,7 @@ pub const Action = union(Key) {
             "configure_charset",
             "set_attribute",
             "kitty_color_report",
+            "kitty_dnd_protocol",
             "color_operation",
             "semantic_prompt",
         },
@@ -2386,6 +2388,10 @@ pub fn Stream(comptime H: type) type {
                     self.handler.vt(.progress_report, v);
                 },
 
+                .kitty_dnd_protocol => |v| {
+                    self.handler.vt(.kitty_dnd_protocol, v);
+                },
+
                 .conemu_sleep,
                 .conemu_show_message_box,
                 .conemu_change_tab_title,
@@ -2397,7 +2403,6 @@ pub fn Stream(comptime H: type) type {
                 .conemu_run_process,
                 .kitty_text_sizing,
                 .kitty_clipboard_protocol,
-                .kitty_dnd_protocol,
                 .context_signal,
                 => {
                     log.debug("unimplemented OSC callback: {}", .{cmd});

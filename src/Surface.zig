@@ -1174,7 +1174,35 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                 .{ .selected = v },
             );
         },
+
+        .dnd => |dnd_msg| {
+            // The message owns any heap payload (e.g. the MIME list); free it
+            // once the apprt has consumed it.
+            defer dnd_msg.deinit();
+            try self.rt_surface.handleDnd(dnd_msg);
+        },
     }
+}
+
+/// Write a Kitty drag-and-drop (OSC 72) sequence to the pty. The apprt calls
+/// this from its native drag-and-drop event handlers to deliver terminal ->
+/// application events and assembled drop data. The bytes are copied, so the
+/// caller may pass a temporary buffer.
+///
+/// Writes are subject to the same readonly gating as any other pty write.
+pub fn sendKittyDnd(self: *Surface, data: []const u8) Allocator.Error!void {
+    if (data.len == 0) return;
+    const dup = try self.alloc.dupe(u8, data);
+    errdefer self.alloc.free(dup);
+    self.queueIo(.{ .write_alloc = .{
+        .alloc = self.alloc,
+        .data = dup,
+    } }, .unlocked);
+}
+
+/// Notify the IO thread that the native OSC 72 source offer is finished.
+pub fn endKittyDndOffer(self: *Surface, session: ?i32) void {
+    self.queueIo(.{ .dnd_offer_end = session }, .unlocked);
 }
 
 fn selectionScrollTick(self: *Surface) !void {

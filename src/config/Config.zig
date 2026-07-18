@@ -2379,6 +2379,12 @@ keybind: Keybinds = .{},
 @"clipboard-read": ClipboardAccess = .ask,
 @"clipboard-write": ClipboardAccess = .allow,
 
+/// Whether to allow programs running in the terminal to participate in the
+/// Kitty drag-and-drop protocol (OSC 72). When enabled, terminal programs
+/// can accept native drops of files/text/MIME data and act as a drag source
+/// offering data to native apps.
+@"clipboard-dnd": bool = true,
+
 /// Trims trailing whitespace on data that is copied to the clipboard. This does
 /// not affect data sent to the clipboard via `clipboard-write`. This only
 /// applies to trailing whitespace on lines that have other characters.

@@ -73,6 +73,9 @@ pub const Message = union(enum) {
     /// The surface gained or lost focus.
     focused: bool,
 
+    /// The native OSC 72 source drag ended or was rejected.
+    dnd_offer_end: ?i32,
+
     /// Write where the data fits in the union.
     write_small: WriteReq.Small,
 

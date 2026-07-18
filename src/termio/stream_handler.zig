@@ -12,6 +12,8 @@ const renderer = @import("../renderer.zig");
 const termio = @import("../termio.zig");
 const terminal = @import("../terminal/main.zig");
 const terminfo = @import("../terminfo/main.zig");
+const kitty_dnd = @import("kitty_dnd.zig");
+const kitty_dnd_format = @import("../apprt/kitty_dnd_format.zig");
 const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
@@ -51,8 +53,22 @@ pub const StreamHandler = struct {
     /// The clipboard write access configuration.
     clipboard_write: configpkg.ClipboardAccess,
 
+    /// Whether the Kitty drag-and-drop protocol (OSC 72) is enabled. When
+    /// false, OSC 72 events are ignored entirely: capability queries go
+    /// unanswered and drops fall back to the apprt's legacy paste path.
+    clipboard_dnd: bool,
+
     //---------------------------------------------------------------
     // Internal state
+
+    /// Decodes and bounds chunked OSC 72 payloads.
+    dnd: kitty_dnd.Decoder = .{},
+
+    /// Source registration and active-offer validation state.
+    dnd_offer: kitty_dnd.OfferState = .{},
+
+    /// Destination registration and session validation state.
+    dnd_destination: kitty_dnd.DestinationState = .{},
 
     /// The APC command handler maintains the APC state. APC is like
     /// CSI or OSC, but it is a private escape sequence that is used
@@ -85,6 +101,7 @@ pub const StreamHandler = struct {
     pub fn deinit(self: *StreamHandler) void {
         self.apc.deinit();
         self.dcs.deinit();
+        self.dnd.deinit(self.alloc);
         if (comptime tmux_enabled) tmux: {
             const viewer = self.tmux_viewer orelse break :tmux;
             viewer.deinit();
@@ -102,14 +119,18 @@ pub const StreamHandler = struct {
 
     /// Change the configuration for this handler.
     pub fn changeConfig(self: *StreamHandler, config: *termio.DerivedConfig) void {
+        const reset_dnd = self.clipboard_dnd and !config.clipboard_dnd;
         self.osc_color_report_format = config.osc_color_report_format;
         self.clipboard_write = config.clipboard_write;
+        self.clipboard_dnd = config.clipboard_dnd;
         self.enquiry_response = config.enquiry_response;
         self.terminal.setDefaultCursorStyle(config.cursor_style);
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
 
         // The config could have changed any of our colors so update mode 2031
         self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
+
+        if (reset_dnd) self.resetDnd();
     }
 
     inline fn surfaceMessageWriter(
@@ -324,6 +345,7 @@ pub const StreamHandler = struct {
             .progress_report => self.progressReport(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
+            .kitty_dnd_protocol => try self.kittyDragAndDrop(value),
             .semantic_prompt => try self.semanticPrompt(value),
             .mouse_shape => try self.setMouseShape(value),
             .configure_charset => self.configureCharset(value.slot, value.charset),
@@ -919,6 +941,8 @@ pub const StreamHandler = struct {
 
         // Clear the progress bar
         self.progressReport(.{ .state = .remove });
+
+        self.resetDnd();
     }
 
     pub fn queryKittyKeyboard(self: *StreamHandler) !void {
@@ -1033,6 +1057,411 @@ pub const StreamHandler = struct {
                 .clipboard_type = clipboard_type,
             },
         });
+    }
+
+    /// Handle a Kitty drag-and-drop protocol (OSC 72) event received from the
+    /// application running in the terminal.
+    fn kittyDragAndDrop(self: *StreamHandler, dnd: terminal.osc.Command.KittyDndProtocol) !void {
+        if (!self.clipboard_dnd) return;
+
+        switch (self.dnd.feed(self.alloc, dnd)) {
+            .incomplete => {},
+            .invalid => self.dndInvalid(),
+            .query => |query| {
+                const resp = kitty_dnd_format.formatCapabilityQuery(
+                    self.alloc,
+                    query.session,
+                ) catch return;
+                self.messageWriter(.{ .write_alloc = .{
+                    .alloc = self.alloc,
+                    .data = resp,
+                } });
+            },
+            .complete => |complete| self.kittyDndComplete(complete),
+        }
+    }
+
+    fn kittyDndComplete(self: *StreamHandler, complete: kitty_dnd.Decoder.Complete) void {
+        const metadata = complete.metadata;
+        const payload = complete.payload;
+        var transferred = false;
+        defer if (!transferred) self.alloc.free(payload);
+
+        switch (metadata.event) {
+            .accept_drops,
+            .stop_accepting_drops,
+            .request_data,
+            .drop_set_operation,
+            .drop_dropped,
+            .request_error,
+            => self.kittyDndDestinationComplete(metadata, payload, &transferred),
+
+            .offer_drag,
+            .present_data,
+            .change_drag_image,
+            .drag_offer_event,
+            .drag_offer_error,
+            => self.kittyDndOfferComplete(metadata, payload, &transferred),
+
+            .query, .uri_list_data => unreachable,
+        }
+    }
+
+    fn kittyDndDestinationComplete(
+        self: *StreamHandler,
+        metadata: kitty_dnd.Decoder.Metadata,
+        payload: []u8,
+        transferred: *bool,
+    ) void {
+        const session = metadata.session;
+
+        switch (metadata.event) {
+            .accept_drops => {
+                // The reference client sends a separate t=a:x=1 machine-id
+                // registration after its MIME registration. Remote drop data
+                // is not implemented yet, so validate and ignore this command
+                // rather than replacing the accepted MIME list with the ID.
+                if (metadata.x == 1) {
+                    if (!kitty_dnd.validMachineId(payload)) {
+                        log.warn("OSC 72 (dnd): invalid drop machine id", .{});
+                    }
+                    return;
+                }
+                if (!kitty_dnd.validMimeList(payload)) {
+                    log.warn("OSC 72 (dnd): invalid accept MIME list", .{});
+                    return;
+                }
+                self.dnd_destination.register(session);
+                self.surfaceMessageWriter(.{ .dnd = .{ .accept = .{
+                    .mimes = self.dndOwned(payload),
+                    .session = session,
+                } } });
+                transferred.* = true;
+            },
+
+            .stop_accepting_drops => {
+                if (!self.dnd_destination.matches(session)) return;
+                self.dnd_destination.unregister();
+                self.surfaceMessageWriter(.{ .dnd = .stop });
+            },
+
+            .request_data => {
+                if (!self.dnd_destination.matches(session)) return;
+                if (metadata.x) |mime_index| {
+                    self.surfaceMessageWriter(.{ .dnd = .{ .request_data = .{
+                        .mime_index = mime_index,
+                    } } });
+                } else {
+                    self.surfaceMessageWriter(.{ .dnd = .{ .finish = .{
+                        .operation = metadata.o orelse 0,
+                    } } });
+                }
+            },
+
+            .drop_set_operation => {
+                if (!self.dnd_destination.matches(session)) return;
+                const operation = metadata.o orelse return;
+                if (operation < 0 or operation > 2) {
+                    log.warn("OSC 72 (dnd): invalid drop operation {d}", .{operation});
+                    return;
+                }
+                if (!kitty_dnd.validMimeList(payload)) {
+                    log.warn("OSC 72 (dnd): invalid drop set-operation MIME list", .{});
+                    return;
+                }
+                self.surfaceMessageWriter(.{ .dnd = .{ .set_operation = .{
+                    .operation = operation,
+                    .mimes = self.dndOwned(payload),
+                } } });
+                transferred.* = true;
+            },
+
+            .drop_dropped, .request_error => {
+                log.warn(
+                    "OSC 72 (dnd): received terminal-emitted event {s} from application, ignoring",
+                    .{@tagName(metadata.event)},
+                );
+            },
+
+            else => unreachable,
+        }
+    }
+
+    fn kittyDndOfferComplete(
+        self: *StreamHandler,
+        metadata: kitty_dnd.Decoder.Metadata,
+        payload: []u8,
+        transferred: *bool,
+    ) void {
+        const session = metadata.session;
+
+        switch (metadata.event) {
+            .offer_drag => {
+                const control = metadata.x orelse 0;
+                if (control != 0) {
+                    self.handleOfferDragControl(control, metadata, payload, transferred);
+                    return;
+                }
+
+                if (!self.dnd_offer.offererMatches(session)) return;
+                const operations = metadata.o orelse {
+                    self.rejectDndOffer(.invalid);
+                    return;
+                };
+                if (operations < 1 or operations > 3) {
+                    self.rejectDndOffer(.invalid);
+                    return;
+                }
+                const mime_count = kitty_dnd.countMimes(payload) orelse {
+                    self.rejectDndOffer(.invalid);
+                    return;
+                };
+                if (mime_count == 0) {
+                    self.rejectDndOffer(.invalid);
+                    return;
+                }
+                self.dnd_offer.beginOffer(mime_count);
+                self.surfaceMessageWriter(.{ .dnd = .{ .offer = .{
+                    .mimes = self.dndOwned(payload),
+                    .operations = operations,
+                } } });
+                transferred.* = true;
+            },
+
+            .present_data => {
+                if (!self.requireActiveOffer(session, .permission)) return;
+                const wire_index = metadata.x orelse 0;
+                if (wire_index >= 0) {
+                    self.handlePreSentMime(metadata, payload, transferred);
+                } else {
+                    self.handlePreSentImage(metadata, payload, transferred);
+                }
+            },
+
+            .change_drag_image => {
+                if (!self.requireActiveOffer(session, .permission)) return;
+                if (payload.len != 0) {
+                    self.rejectDndOffer(.invalid);
+                    return;
+                }
+                const image_index = metadata.x orelse 0;
+                if (image_index == -1) {
+                    self.surfaceMessageWriter(.{ .dnd = .start });
+                } else {
+                    self.surfaceMessageWriter(.{ .dnd = .{
+                        .image_select = .{
+                            .image_index = image_index,
+                        },
+                    } });
+                }
+            },
+
+            .drag_offer_event => {
+                if (!self.requireActiveOffer(session, .invalid)) return;
+                if ((metadata.x orelse 0) != 0) {
+                    self.rejectDndOffer(.invalid);
+                    return;
+                }
+                const mime_index = metadata.y orelse 0;
+                if (self.dnd_offer.registerLazyData(mime_index, payload.len)) |err| {
+                    self.rejectDndOffer(err);
+                    return;
+                }
+                self.surfaceMessageWriter(.{ .dnd = .{ .lazy_data = .{
+                    .data = self.dndOwned(payload),
+                    .mime_index = mime_index,
+                } } });
+                transferred.* = true;
+            },
+
+            .drag_offer_error => {
+                if (!self.requireActiveOffer(session, .invalid)) return;
+                if ((metadata.x orelse 0) != 0) {
+                    self.rejectDndOffer(.invalid);
+                    return;
+                }
+                const mime_index = metadata.y orelse 0;
+                if (mime_index == -1) {
+                    if (payload.len != 0) {
+                        self.rejectDndOffer(.invalid);
+                        return;
+                    }
+                    self.dndOfferEnd(session);
+                    self.surfaceMessageWriter(.{ .dnd = .client_cancel });
+                    return;
+                }
+                if (!self.dnd_offer.validMimeIndex(mime_index) or
+                    !kitty_dnd.validClientError(payload))
+                {
+                    self.rejectDndOffer(.invalid);
+                    return;
+                }
+                self.surfaceMessageWriter(.{ .dnd = .{
+                    .client_error = .{
+                        .error_payload = self.dndOwned(payload),
+                        .mime_index = mime_index,
+                    },
+                } });
+                transferred.* = true;
+            },
+
+            else => unreachable,
+        }
+    }
+
+    fn handleOfferDragControl(
+        self: *StreamHandler,
+        control: i32,
+        metadata: kitty_dnd.Decoder.Metadata,
+        payload: []u8,
+        transferred: *bool,
+    ) void {
+        const session = metadata.session;
+        if (metadata.o != null) {
+            if (self.dnd_offer.offererMatches(session)) {
+                self.rejectDndOffer(.invalid);
+            }
+            return;
+        }
+
+        switch (control) {
+            1 => {
+                // Invalid machine IDs are ignored. The macOS apprt does not
+                // use the registration machine ID today.
+                if (!kitty_dnd.validMachineId(payload)) return;
+                self.dnd_offer.register(session);
+                self.surfaceMessageWriter(.{ .dnd = .{ .register_drag = .{
+                    .machine_id = self.dndOwned(payload),
+                    .session = session,
+                } } });
+                transferred.* = true;
+            },
+            2 => {
+                if (payload.len != 0 or !self.dnd_offer.offererMatches(session)) {
+                    return;
+                }
+                self.dnd_offer.unregister();
+                self.surfaceMessageWriter(.{ .dnd = .unregister_drag });
+            },
+            else => {
+                if (self.dnd_offer.offererMatches(session)) {
+                    self.rejectDndOffer(.invalid);
+                }
+            },
+        }
+    }
+
+    fn handlePreSentMime(
+        self: *StreamHandler,
+        metadata: kitty_dnd.Decoder.Metadata,
+        payload: []u8,
+        transferred: *bool,
+    ) void {
+        const mime_index = metadata.x orelse 0;
+
+        if (self.dnd_offer.registerPreSentData(mime_index, payload.len)) |err| {
+            self.rejectDndOffer(err);
+            return;
+        }
+        self.surfaceMessageWriter(.{ .dnd = .{
+            .pre_sent_data = .{
+                .data = self.dndOwned(payload),
+                .mime_index = mime_index,
+            },
+        } });
+        transferred.* = true;
+    }
+
+    fn handlePreSentImage(
+        self: *StreamHandler,
+        metadata: kitty_dnd.Decoder.Metadata,
+        payload: []u8,
+        transferred: *bool,
+    ) void {
+        const wire_index = metadata.x orelse 0;
+        const format = metadata.y orelse 0;
+        const width = metadata.X orelse 0;
+        const height = metadata.Y orelse 0;
+        const opacity = metadata.o orelse 0;
+
+        if (wire_index == std.math.minInt(i32)) {
+            self.rejectDndOffer(.invalid);
+            return;
+        }
+        const image_index = -wire_index - 1;
+        if (image_index != self.dnd_offer.next_image) {
+            self.rejectDndOffer(.invalid);
+            return;
+        }
+        if (self.dnd_offer.registerImage(format, width, height, opacity, payload)) |err| {
+            self.rejectDndOffer(err);
+            return;
+        }
+        self.dnd_offer.next_image += 1;
+        self.surfaceMessageWriter(.{ .dnd = .{
+            .pre_sent_image = .{
+                .data = self.dndOwned(payload),
+                .image_index = image_index,
+                .format = format,
+                .width = width,
+                .height = height,
+                .opacity = opacity,
+            },
+        } });
+        transferred.* = true;
+    }
+
+    fn dndOwned(self: *StreamHandler, payload: []u8) apprt.surface.Message.WriteReq {
+        return .{ .alloc = .{
+            .alloc = self.alloc,
+            .data = payload,
+        } };
+    }
+
+    fn requireActiveOffer(self: *StreamHandler, session: ?i32, err: kitty_dnd_format.DndError) bool {
+        if (self.dnd_offer.offerMatches(session)) return true;
+        if (self.dnd_offer.offererMatches(session)) self.rejectDndOffer(err);
+        return false;
+    }
+
+    pub fn dndOfferEnd(self: *StreamHandler, session: ?i32) void {
+        if (!self.dnd_offer.offererMatches(session)) return;
+        self.dnd.resetDrag(self.alloc, session);
+        self.dnd_offer.clearActive();
+    }
+
+    fn dndInvalid(self: *StreamHandler) void {
+        log.warn("OSC 72 (dnd): invalid command or transfer", .{});
+        const failure = self.dnd.last_failure orelse return;
+        const metadata = failure.metadata orelse return;
+        if (!kitty_dnd.isSourceOfferEvent(metadata.event)) return;
+        if (!self.dnd_offer.offererMatches(metadata.session)) return;
+
+        self.rejectDndOffer(failure.err);
+    }
+
+    fn rejectDndOffer(self: *StreamHandler, err: kitty_dnd_format.DndError) void {
+        if (!self.dnd_offer.registered) return;
+        const resp = kitty_dnd_format.formatDragResult(
+            self.alloc,
+            self.dnd_offer.session,
+            err.posixName(),
+            null,
+        ) catch return;
+        self.messageWriter(.{ .write_alloc = .{
+            .alloc = self.alloc,
+            .data = resp,
+        } });
+
+        self.dnd_offer.clearActive();
+        self.surfaceMessageWriter(.{ .dnd = .abort });
+    }
+
+    fn resetDnd(self: *StreamHandler) void {
+        self.dnd.reset(self.alloc);
+        self.dnd_offer.reset();
+        self.dnd_destination.reset();
+        self.surfaceMessageWriter(.{ .dnd = .reset });
     }
 
     fn semanticPrompt(

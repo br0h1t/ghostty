@@ -98,6 +98,12 @@ pub fn defaultTermioEnv(self: *Self) !std.process.Environ.Map {
     return try self.surface.defaultTermioEnv();
 }
 
+/// Handle an inbound Kitty drag-and-drop (OSC 72) event. The GTK apprt does
+/// not implement native drag-and-drop for this protocol yet; events are
+/// dropped and drops fall through to the default paste path. The caller frees
+/// any owned payload on the message.
+pub fn handleDnd(_: *Self, _: apprt.surface.DndMessage) !void {}
+
 /// Redraw the inspector for our surface.
 pub fn redrawInspector(self: *Self) void {
     self.surface.redrawInspector();

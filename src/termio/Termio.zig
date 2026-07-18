@@ -168,6 +168,7 @@ pub const DerivedConfig = struct {
     background: configpkg.Config.Color,
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
     clipboard_write: configpkg.ClipboardAccess,
+    clipboard_dnd: bool,
     enquiry_response: []const u8,
     conditional_state: configpkg.ConditionalState,
 
@@ -204,6 +205,7 @@ pub const DerivedConfig = struct {
             .background = config.background,
             .osc_color_report_format = config.@"osc-color-report-format",
             .clipboard_write = config.@"clipboard-write",
+            .clipboard_dnd = config.@"clipboard-dnd",
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
             .conditional_state = config._conditional_state,
 
@@ -287,6 +289,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .terminal = &self.terminal,
         .osc_color_report_format = opts.config.osc_color_report_format,
         .clipboard_write = opts.config.clipboard_write,
+        .clipboard_dnd = opts.config.clipboard_dnd,
         .enquiry_response = opts.config.enquiry_response,
     };
 
@@ -635,6 +638,11 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 
     // We always notify our backend of focus changes.
     try self.backend.focusGained(td, focused);
+}
+
+/// Clear IO-thread validation state for a completed native source drag.
+pub fn dndOfferEnd(self: *Termio, session: ?i32) void {
+    self.terminal_stream.handler.dndOfferEnd(session);
 }
 
 /// Process output from the pty. This is the manual API that users can

@@ -108,6 +108,10 @@ pub const Message = union(enum) {
     /// Selected search index change
     search_selected: ?usize,
 
+    /// An inbound Kitty drag-and-drop (OSC 72) event from the application
+    /// running in the terminal that the apprt must act on. See `DndMessage`.
+    dnd: DndMessage,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
@@ -129,6 +133,174 @@ pub const Message = union(enum) {
             .none => void,
         };
     };
+};
+
+/// An inbound Kitty drag-and-drop (OSC 72) event, produced on the IO thread
+/// by the stream handler and delivered to the apprt via `Message.dnd`. The
+/// apprt acts on these to drive native (OS) drag-and-drop. Only the events
+/// that require apprt involvement are represented here; pure responses that
+/// the terminal emits to the application are written directly to the pty.
+///
+/// Drag-and-drop is handled entirely within the apprt, so these never cross
+/// the libghostty-vt C ABI.
+pub const DndMessage = union(enum) {
+    /// The application registered as willing to accept drops (OSC 72 `t=a`).
+    /// The apprt should begin forwarding OS drop activity to the pty.
+    accept: Accept,
+
+    /// The application responded to an in-progress drag (OSC 72 `t=m` with
+    /// `o` set) indicating which operation it will perform if the drop
+    /// occurs. The apprt should report this operation to the OS.
+    set_operation: SetOperation,
+
+    /// The application unregistered as a drop target (OSC 72 `t=A`). The
+    /// apprt should stop forwarding OS drop activity and abort any pending
+    /// drop transfer.
+    stop: void,
+
+    /// The application is requesting the data for the drop it was offered,
+    /// by MIME index into the list the terminal sent (OSC 72 `t=r` with `x`).
+    request_data: RequestData,
+
+    /// The application signaled that the in-progress drop transfer is complete
+    /// (OSC 72 `t=r` with `o` set and no MIME index). The apprt should finish
+    /// the OS drop with the given operation and release it.
+    finish: Finish,
+
+    /// The application registered as a native drag source (`t=o:x=1`).
+    register_drag: Register,
+
+    /// The application unregistered as a native drag source (`t=o:x=2`).
+    unregister_drag: void,
+
+    /// The application supplied the MIME offer and operation flags for the
+    /// pending source gesture (`t=o:o=flags`).
+    offer: Offer,
+
+    /// Pre-sent data for a zero-based MIME index (`t=p:x=idx`).
+    pre_sent_data: PreSentData,
+
+    /// Pre-sent image data. The protocol's negative `x` value is normalized
+    /// into a zero-based image index.
+    pre_sent_image: PreSentImage,
+
+    /// Select or remove the current drag image (`t=P:x=idx`).
+    image_select: ImageSelect,
+
+    /// Start the native drag (`t=P:x=-1`).
+    start: void,
+
+    /// A completed lazy response for a zero-based MIME index
+    /// (`t=e:y=idx` plus base64 chunks and explicit EOF).
+    lazy_data: LazyData,
+
+    /// The client failed to provide a requested MIME representation (`t=E:y=idx`).
+    client_error: ClientError,
+
+    /// The client canceled the full source drag (`t=E:y=-1`).
+    client_cancel: void,
+
+    /// The terminal aborted the current source offer after a malformed or
+    /// resource-limited transfer.
+    abort: void,
+
+    /// Reset all destination and source drag state.
+    reset: void,
+
+    pub const Accept = struct {
+        /// Space-separated MIME types the application accepts. May be empty.
+        /// Owned; freed by `deinit`.
+        mimes: WriteReq,
+
+        /// Multiplexer session ID echoed back in responses when set.
+        session: ?i32,
+    };
+
+    pub const SetOperation = struct {
+        /// The operation the application will perform if a drop occurs:
+        /// 0 = reject, 1 = copy, 2 = move.
+        operation: i32,
+
+        /// Space-separated, ordered MIME types the application wants, in
+        /// decreasing order of preference, narrowed from the offered list.
+        /// May be empty (meaning "no change").
+        mimes: WriteReq,
+    };
+
+    pub const RequestData = struct {
+        /// MIME index into the list the terminal offered in its `t=M` event.
+        mime_index: i32,
+    };
+
+    pub const Finish = struct {
+        /// The drop operation the application selected: 0 = reject, 1 = copy,
+        /// 2 = move, 3 = copy-or-move.
+        operation: i32,
+    };
+
+    pub const Register = struct {
+        machine_id: WriteReq,
+        session: ?i32,
+    };
+
+    pub const Offer = struct {
+        mimes: WriteReq,
+        operations: i32,
+    };
+
+    pub const PreSentData = struct {
+        data: WriteReq,
+        mime_index: i32,
+    };
+
+    pub const PreSentImage = struct {
+        data: WriteReq,
+        image_index: i32,
+        format: i32,
+        width: i32,
+        height: i32,
+        opacity: i32,
+    };
+
+    pub const ImageSelect = struct {
+        image_index: i32,
+    };
+
+    pub const LazyData = struct {
+        data: WriteReq,
+        mime_index: i32,
+    };
+
+    pub const ClientError = struct {
+        error_payload: WriteReq,
+        mime_index: i32,
+    };
+
+    /// The `WriteReq` type used for owned payloads in this union.
+    pub const WriteReq = Message.WriteReq;
+
+    pub fn deinit(self: DndMessage) void {
+        switch (self) {
+            .accept => |v| v.mimes.deinit(),
+            .set_operation => |v| v.mimes.deinit(),
+            .register_drag => |v| v.machine_id.deinit(),
+            .offer => |v| v.mimes.deinit(),
+            .pre_sent_data => |v| v.data.deinit(),
+            .pre_sent_image => |v| v.data.deinit(),
+            .lazy_data => |v| v.data.deinit(),
+            .client_error => |v| v.error_payload.deinit(),
+            .stop,
+            .request_data,
+            .finish,
+            .unregister_drag,
+            .image_select,
+            .start,
+            .client_cancel,
+            .abort,
+            .reset,
+            => {},
+        }
+    }
 };
 
 /// A surface mailbox.
