@@ -1023,6 +1023,18 @@ typedef enum {
   GHOSTTY_DND_STOP,
   GHOSTTY_DND_REQUEST_DATA,
   GHOSTTY_DND_FINISH,
+  GHOSTTY_DND_REGISTER,
+  GHOSTTY_DND_UNREGISTER,
+  GHOSTTY_DND_OFFER,
+  GHOSTTY_DND_PRE_SENT_DATA,
+  GHOSTTY_DND_PRE_SENT_IMAGE,
+  GHOSTTY_DND_IMAGE_SELECT,
+  GHOSTTY_DND_START,
+  GHOSTTY_DND_LAZY_DATA,
+  GHOSTTY_DND_CLIENT_ERROR,
+  GHOSTTY_DND_CLIENT_CANCEL,
+  GHOSTTY_DND_ABORT,
+  GHOSTTY_DND_RESET,
 } ghostty_dnd_event_tag_e;
 
 typedef struct {
@@ -1045,11 +1057,62 @@ typedef struct {
   int32_t operation;
 } ghostty_dnd_finish_s;
 
+typedef struct {
+  const uint8_t* machine_id;
+  size_t machine_id_len;
+  int32_t session;
+} ghostty_dnd_register_s;
+
+typedef struct {
+  const uint8_t* mimes;
+  size_t mimes_len;
+  int32_t operations;
+} ghostty_dnd_offer_s;
+
+typedef struct {
+  const uint8_t* data;
+  size_t data_len;
+  int32_t mime_index;
+} ghostty_dnd_pre_sent_data_s;
+
+typedef struct {
+  const uint8_t* data;
+  size_t data_len;
+  int32_t image_index;
+  int32_t format;
+  int32_t width;
+  int32_t height;
+  int32_t opacity;
+} ghostty_dnd_pre_sent_image_s;
+
+typedef struct {
+  int32_t image_index;
+} ghostty_dnd_image_select_s;
+
+typedef struct {
+  const uint8_t* data;
+  size_t data_len;
+  int32_t mime_index;
+} ghostty_dnd_lazy_data_s;
+
+typedef struct {
+  const uint8_t* error_payload;
+  size_t error_payload_len;
+  int32_t mime_index;
+} ghostty_dnd_client_error_s;
+
 typedef union {
   ghostty_dnd_accept_s accept;
   ghostty_dnd_set_operation_s set_operation;
   ghostty_dnd_request_data_s request_data;
   ghostty_dnd_finish_s finish;
+  ghostty_dnd_register_s register_drag;
+  ghostty_dnd_offer_s offer;
+  ghostty_dnd_pre_sent_data_s pre_sent_data;
+  ghostty_dnd_pre_sent_image_s pre_sent_image;
+  ghostty_dnd_image_select_s image_select;
+  ghostty_dnd_lazy_data_s lazy_data;
+  ghostty_dnd_client_error_s client_error;
 } ghostty_dnd_event_u;
 
 typedef struct {
@@ -1207,6 +1270,15 @@ GHOSTTY_API void ghostty_surface_dnd_drop(ghostty_surface_t, int32_t, double, do
 GHOSTTY_API void ghostty_surface_dnd_data(ghostty_surface_t, int32_t, int32_t, const uint8_t*, uintptr_t);
 GHOSTTY_API void ghostty_surface_dnd_data_eof(ghostty_surface_t, int32_t, int32_t);
 GHOSTTY_API void ghostty_surface_dnd_data_error(ghostty_surface_t, int32_t, int32_t, const char*, const char*);
+GHOSTTY_API void ghostty_surface_dnd_prompt(ghostty_surface_t, int32_t, double, double);
+GHOSTTY_API void ghostty_surface_dnd_start_response(ghostty_surface_t, int32_t, const char*, const char*);
+GHOSTTY_API void ghostty_surface_dnd_offer_error(ghostty_surface_t, int32_t, int32_t, const char*, const char*);
+GHOSTTY_API void ghostty_surface_dnd_abort_drag(ghostty_surface_t, int32_t, const char*, const char*);
+GHOSTTY_API void ghostty_surface_dnd_offer_accepted(ghostty_surface_t, int32_t, int32_t);
+GHOSTTY_API void ghostty_surface_dnd_action_changed(ghostty_surface_t, int32_t, int32_t);
+GHOSTTY_API void ghostty_surface_dnd_dropped(ghostty_surface_t, int32_t);
+GHOSTTY_API void ghostty_surface_dnd_finished(ghostty_surface_t, int32_t, bool);
+GHOSTTY_API void ghostty_surface_dnd_request_data(ghostty_surface_t, int32_t, int32_t);
 
 GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
@@ -1218,6 +1290,7 @@ GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 #ifdef __APPLE__
 GHOSTTY_API void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);
 GHOSTTY_API void* ghostty_surface_quicklook_font(ghostty_surface_t);
+GHOSTTY_API void* ghostty_surface_symbols_font(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_quicklook_word(ghostty_surface_t, ghostty_text_s*);
 #endif
 

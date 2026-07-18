@@ -1038,6 +1038,116 @@ pub const Surface = struct {
                 } };
                 dnd(self.userdata, &event);
             },
+
+            .register_drag => |v| {
+                const machine_id = v.machine_id.slice();
+                const event: CAPI.DndEvent = .{ .tag = .register_drag, .event = .{
+                    .register_drag = .{
+                        .machine_id = machine_id.ptr,
+                        .machine_id_len = machine_id.len,
+                        .session = dndSession(v.session),
+                    },
+                } };
+                dnd(self.userdata, &event);
+            },
+
+            .unregister_drag => {
+                const event: CAPI.DndEvent = .{ .tag = .unregister_drag, .event = undefined };
+                dnd(self.userdata, &event);
+            },
+
+            .offer => |v| {
+                const mimes = v.mimes.slice();
+                const event: CAPI.DndEvent = .{ .tag = .offer, .event = .{
+                    .offer = .{
+                        .mimes = mimes.ptr,
+                        .mimes_len = mimes.len,
+                        .operations = v.operations,
+                    },
+                } };
+                dnd(self.userdata, &event);
+            },
+
+            .pre_sent_data => |v| {
+                const data = v.data.slice();
+                const event: CAPI.DndEvent = .{ .tag = .pre_sent_data, .event = .{
+                    .pre_sent_data = .{
+                        .data = data.ptr,
+                        .data_len = data.len,
+                        .mime_index = v.mime_index,
+                    },
+                } };
+                dnd(self.userdata, &event);
+            },
+
+            .pre_sent_image => |v| {
+                const data = v.data.slice();
+                const event: CAPI.DndEvent = .{ .tag = .pre_sent_image, .event = .{
+                    .pre_sent_image = .{
+                        .data = data.ptr,
+                        .data_len = data.len,
+                        .image_index = v.image_index,
+                        .format = v.format,
+                        .width = v.width,
+                        .height = v.height,
+                        .opacity = v.opacity,
+                    },
+                } };
+                dnd(self.userdata, &event);
+            },
+
+            .image_select => |v| {
+                const event: CAPI.DndEvent = .{ .tag = .image_select, .event = .{
+                    .image_select = .{
+                        .image_index = v.image_index,
+                    },
+                } };
+                dnd(self.userdata, &event);
+            },
+
+            .start => {
+                const event: CAPI.DndEvent = .{ .tag = .start, .event = undefined };
+                dnd(self.userdata, &event);
+            },
+
+            .lazy_data => |v| {
+                const data = v.data.slice();
+                const event: CAPI.DndEvent = .{ .tag = .lazy_data, .event = .{
+                    .lazy_data = .{
+                        .data = data.ptr,
+                        .data_len = data.len,
+                        .mime_index = v.mime_index,
+                    },
+                } };
+                dnd(self.userdata, &event);
+            },
+
+            .client_error => |v| {
+                const error_payload = v.error_payload.slice();
+                const event: CAPI.DndEvent = .{ .tag = .client_error, .event = .{
+                    .client_error = .{
+                        .error_payload = error_payload.ptr,
+                        .error_payload_len = error_payload.len,
+                        .mime_index = v.mime_index,
+                    },
+                } };
+                dnd(self.userdata, &event);
+            },
+
+            .client_cancel => {
+                const event: CAPI.DndEvent = .{ .tag = .client_cancel, .event = undefined };
+                dnd(self.userdata, &event);
+            },
+
+            .abort => {
+                const event: CAPI.DndEvent = .{ .tag = .abort, .event = undefined };
+                dnd(self.userdata, &event);
+            },
+
+            .reset => {
+                const event: CAPI.DndEvent = .{ .tag = .reset, .event = undefined };
+                dnd(self.userdata, &event);
+            },
         }
     }
 
@@ -1055,10 +1165,6 @@ pub const Surface = struct {
             .px_x = @intFromFloat(@round(px.x)),
             .px_y = @intFromFloat(@round(px.y)),
         };
-    }
-
-    fn sessionOrNull(session: i32) ?i32 {
-        return if (session >= 0) session else null;
     }
 
     /// Writes the OSC 72 bytes produced by a `kitty_dnd_format` call.
@@ -1182,6 +1288,89 @@ pub const Surface = struct {
             session,
             posix_name,
             desc,
+        ));
+    }
+
+    /// Prompts the registered source client for an offer after a native drag
+    /// gesture has crossed the platform threshold.
+    pub fn dndPrompt(self: *Surface, session: ?i32, x: f64, y: f64) void {
+        const pos = self.dndPosToCell(x, y) catch |err| {
+            log.err("error converting source dnd position to pixels err={}", .{err});
+            return;
+        };
+        self.sendDnd(kitty_dnd_format.formatDragPrompt(
+            self.app.core_app.alloc,
+            session,
+            pos,
+        ));
+    }
+
+    pub fn dndStartResult(
+        self: *Surface,
+        session: ?i32,
+        posix_name: []const u8,
+        desc: ?[]const u8,
+    ) void {
+        self.sendDnd(kitty_dnd_format.formatDragResult(
+            self.app.core_app.alloc,
+            session,
+            posix_name,
+            desc,
+        ));
+        if (!std.mem.eql(u8, posix_name, "OK")) {
+            self.core_surface.endKittyDndOffer(session);
+        }
+    }
+
+    pub fn dndOfferError(
+        self: *Surface,
+        session: ?i32,
+        mime_index: i32,
+        posix_name: []const u8,
+        desc: ?[]const u8,
+    ) void {
+        self.sendDnd(kitty_dnd_format.formatDragOfferError(
+            self.app.core_app.alloc,
+            session,
+            mime_index,
+            posix_name,
+            desc,
+        ));
+    }
+
+    /// Aborts an active native drag and informs the client with `t=E`.
+    pub fn dndAbortDrag(
+        self: *Surface,
+        session: ?i32,
+        posix_name: []const u8,
+        desc: ?[]const u8,
+    ) void {
+        self.sendDnd(kitty_dnd_format.formatDragResult(
+            self.app.core_app.alloc,
+            session,
+            posix_name,
+            desc,
+        ));
+        self.core_surface.endKittyDndOffer(session);
+    }
+
+    pub fn dndStatus(self: *Surface, session: ?i32, status: kitty_dnd_format.DragStatus) void {
+        self.sendDnd(kitty_dnd_format.formatDragStatus(
+            self.app.core_app.alloc,
+            session,
+            status,
+        ));
+        switch (status) {
+            .finished => self.core_surface.endKittyDndOffer(session),
+            else => {},
+        }
+    }
+
+    pub fn dndRequestData(self: *Surface, session: ?i32, mime_index: i32) void {
+        self.sendDnd(kitty_dnd_format.formatDragDataRequest(
+            self.app.core_app.alloc,
+            session,
+            mime_index,
         ));
     }
 
@@ -1596,6 +1785,18 @@ pub const CAPI = struct {
         stop = 2,
         request_data = 3,
         finish = 4,
+        register_drag = 5,
+        unregister_drag = 6,
+        offer = 7,
+        pre_sent_data = 8,
+        pre_sent_image = 9,
+        image_select = 10,
+        start = 11,
+        lazy_data = 12,
+        client_error = 13,
+        client_cancel = 14,
+        abort = 15,
+        reset = 16,
     };
 
     // ghostty_dnd_accept_s
@@ -1624,12 +1825,70 @@ pub const CAPI = struct {
         operation: i32,
     };
 
+    // ghostty_dnd_register_s
+    const DndRegister = extern struct {
+        machine_id: [*]const u8,
+        machine_id_len: usize,
+        session: i32,
+    };
+
+    // ghostty_dnd_offer_s
+    const DndOffer = extern struct {
+        mimes: [*]const u8,
+        mimes_len: usize,
+        operations: i32,
+    };
+
+    // ghostty_dnd_pre_sent_data_s
+    const DndPreSentData = extern struct {
+        data: [*]const u8,
+        data_len: usize,
+        mime_index: i32,
+    };
+
+    // ghostty_dnd_pre_sent_image_s
+    const DndPreSentImage = extern struct {
+        data: [*]const u8,
+        data_len: usize,
+        image_index: i32,
+        format: i32,
+        width: i32,
+        height: i32,
+        opacity: i32,
+    };
+
+    // ghostty_dnd_image_select_s
+    const DndImageSelect = extern struct {
+        image_index: i32,
+    };
+
+    // ghostty_dnd_lazy_data_s
+    const DndLazyData = extern struct {
+        data: [*]const u8,
+        data_len: usize,
+        mime_index: i32,
+    };
+
+    // ghostty_dnd_client_error_s
+    const DndClientError = extern struct {
+        error_payload: [*]const u8,
+        error_payload_len: usize,
+        mime_index: i32,
+    };
+
     // ghostty_dnd_event_u
     const DndEventUnion = extern union {
         accept: DndAccept,
         set_operation: DndSetOperation,
         request_data: DndRequestData,
         finish: DndFinish,
+        register_drag: DndRegister,
+        offer: DndOffer,
+        pre_sent_data: DndPreSentData,
+        pre_sent_image: DndPreSentImage,
+        image_select: DndImageSelect,
+        lazy_data: DndLazyData,
+        client_error: DndClientError,
     };
 
     // ghostty_dnd_event_s
@@ -2245,8 +2504,6 @@ pub const CAPI = struct {
         );
     }
 
-    // MARK: Kitty drag-and-drop (OSC 72)
-
     /// Helper to convert representation from C to Zig (-1 -> null)
     fn dndSession(session: i32) ?i32 {
         return if (session >= 0) session else null;
@@ -2331,6 +2588,91 @@ pub const CAPI = struct {
             std.mem.span(posix_name),
             std.mem.span(desc),
         );
+    }
+
+    /// Report that a native source gesture is ready for the client to offer MIME types.
+    export fn ghostty_surface_dnd_prompt(
+        surface: *Surface,
+        session: i32,
+        x: f64,
+        y: f64,
+    ) void {
+        surface.dndPrompt(dndSession(session), x, y);
+    }
+
+    /// Report OK or a POSIX error after attempting to start the native drag.
+    export fn ghostty_surface_dnd_start_response(
+        surface: *Surface,
+        session: i32,
+        posix_name: [*:0]const u8,
+        desc: ?[*:0]const u8,
+    ) void {
+        surface.dndStartResult(dndSession(session), std.mem.span(posix_name), std.mem.span(desc));
+    }
+
+    /// Report a per-MIME POSIX error during an active native drag.
+    export fn ghostty_surface_dnd_offer_error(
+        surface: *Surface,
+        session: i32,
+        mime_index: i32,
+        posix_name: [*:0]const u8,
+        desc: ?[*:0]const u8,
+    ) void {
+        surface.dndOfferError(
+            dndSession(session),
+            mime_index,
+            std.mem.span(posix_name),
+            std.mem.span(desc),
+        );
+    }
+
+    /// Abort an active native drag and inform the client with `t=E`.
+    export fn ghostty_surface_dnd_abort_drag(
+        surface: *Surface,
+        session: i32,
+        posix_name: [*:0]const u8,
+        desc: ?[*:0]const u8,
+    ) void {
+        surface.dndAbortDrag(dndSession(session), std.mem.span(posix_name), std.mem.span(desc));
+    }
+
+    export fn ghostty_surface_dnd_offer_accepted(
+        surface: *Surface,
+        session: i32,
+        mime_index: i32,
+    ) void {
+        surface.dndStatus(dndSession(session), .{ .accepted = mime_index });
+    }
+
+    export fn ghostty_surface_dnd_action_changed(
+        surface: *Surface,
+        session: i32,
+        operation: i32,
+    ) void {
+        surface.dndStatus(dndSession(session), .{ .action_changed = operation });
+    }
+
+    export fn ghostty_surface_dnd_dropped(
+        surface: *Surface,
+        session: i32,
+    ) void {
+        surface.dndStatus(dndSession(session), .dropped);
+    }
+
+    export fn ghostty_surface_dnd_finished(
+        surface: *Surface,
+        session: i32,
+        canceled: bool,
+    ) void {
+        surface.dndStatus(dndSession(session), .{ .finished = canceled });
+    }
+
+    export fn ghostty_surface_dnd_request_data(
+        surface: *Surface,
+        session: i32,
+        mime_index: i32,
+    ) void {
+        surface.dndRequestData(dndSession(session), mime_index);
     }
 
     export fn ghostty_surface_inspector(ptr: *Surface) ?*Inspector {
@@ -2457,6 +2799,29 @@ pub const CAPI = struct {
             surface.renderer_thread.wakeup.notify() catch {};
         }
 
+        /// Copies `face`'s CTFont at its natural (unscaled) point size, for
+        /// callers that render text outside the terminal grid at 1x and
+        /// apply any scaling themselves. Shared by the font exports below.
+        fn copyFontAtNaturalSize(
+            face: *font.Face,
+            content_scale: apprt.ContentScale,
+        ) ?*anyopaque {
+            const size: f32 = size: {
+                const num = face.font.copyAttribute(.size) orelse
+                    break :size 12;
+                defer num.release();
+                var v: f32 = 12;
+                _ = num.getValue(.float, &v);
+                break :size v;
+            };
+
+            return face.font.copyWithAttributes(
+                size / content_scale.y,
+                null,
+                null,
+            ) catch null;
+        }
+
         /// This returns a CTFontRef that should be used for quicklook
         /// highlighted text. This is always the primary font in use
         /// regardless of the selected text. If coretext is not in use
@@ -2479,27 +2844,31 @@ pub const CAPI = struct {
 
             const collection = &grid.resolver.collection;
             const face = collection.getFace(.{}) catch return null;
+            return copyFontAtNaturalSize(face, content_scale);
+        }
 
-            // We need to unscale the content scale. We apply the
-            // content scale to our font stack because we are rendering
-            // at 1x but callers of this should be using scaled or apply
-            // scale themselves.
-            const size: f32 = size: {
-                const num = face.font.copyAttribute(.size) orelse
-                    break :size 12;
-                defer num.release();
-                var v: f32 = 12;
-                _ = num.getValue(.float, &v);
-                break :size v;
+        /// This returns a CTFontRef for Ghostty's embedded symbols-only Nerd Font
+        export fn ghostty_surface_symbols_font(ptr: *Surface) ?*anyopaque {
+            if (comptime font.options.backend != .coretext) {
+                return null;
+            }
+            const content_scale = ptr.getContentScale() catch return null;
+
+            const load_options = load_options: {
+                const grid = ptr.core_surface.renderer.font_grid;
+                grid.lock.lockSharedUncancelable(global.io());
+                defer grid.lock.unlockShared(global.io());
+                break :load_options grid.resolver.collection.load_options orelse
+                    return null;
             };
-
-            const copy = face.font.copyWithAttributes(
-                size / content_scale.y,
-                null,
-                null,
+            var face = font.Face.init(
+                load_options.library,
+                font.embedded.symbols_nerd_font,
+                load_options.faceOptions(),
             ) catch return null;
+            defer face.deinit();
 
-            return copy;
+            return copyFontAtNaturalSize(&face, content_scale);
         }
 
         /// This returns the selected word for quicklook. This will populate

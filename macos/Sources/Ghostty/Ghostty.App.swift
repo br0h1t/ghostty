@@ -463,9 +463,85 @@ extension Ghostty {
                 let finish = payload.event.finish
                 surfaceView.dndFinish(operation: finish.operation)
 
+            case GHOSTTY_DND_REGISTER:
+                let registration = payload.event.register_drag
+                surfaceView.dndDrag.setRegistration(enabled: true, session: registration.session)
+
+            case GHOSTTY_DND_UNREGISTER:
+                surfaceView.dndDrag.setRegistration(enabled: false)
+
+            case GHOSTTY_DND_OFFER:
+                let offer = payload.event.offer
+                surfaceView.dndDrag.receiveOffer(
+                    mimes: dndString(offer.mimes, count: offer.mimes_len),
+                    operations: offer.operations)
+
+            case GHOSTTY_DND_PRE_SENT_DATA:
+                let value = payload.event.pre_sent_data
+                surfaceView.dndDrag.receivePreSentData(
+                    index: value.mime_index,
+                    data: dndData(value.data, count: value.data_len))
+
+            case GHOSTTY_DND_PRE_SENT_IMAGE:
+                let value = payload.event.pre_sent_image
+                surfaceView.dndDrag.receivePreSentImage(
+                    .init(
+                        index: value.image_index,
+                        format: value.format,
+                        width: value.width,
+                        height: value.height,
+                        opacity: value.opacity),
+                    data: dndData(value.data, count: value.data_len))
+
+            case GHOSTTY_DND_IMAGE_SELECT:
+                let value = payload.event.image_select
+                surfaceView.dndDrag.receiveImageSelect(index: value.image_index)
+
+            case GHOSTTY_DND_START:
+                surfaceView.dndDrag.receiveStartDrag()
+
+            case GHOSTTY_DND_LAZY_DATA:
+                let value = payload.event.lazy_data
+                surfaceView.dndDrag.receiveLazyData(
+                    index: value.mime_index,
+                    data: dndData(value.data, count: value.data_len))
+
+            case GHOSTTY_DND_CLIENT_ERROR:
+                let value = payload.event.client_error
+                surfaceView.dndDrag.receiveError(
+                    index: value.mime_index,
+                    payload: dndString(value.error_payload, count: value.error_payload_len))
+
+            case GHOSTTY_DND_CLIENT_CANCEL:
+                surfaceView.dndDrag.receiveCancel()
+
+            case GHOSTTY_DND_ABORT:
+                surfaceView.dndDrag.abort()
+
+            case GHOSTTY_DND_RESET:
+                surfaceView.dndStop()
+                surfaceView.dndDrag.reset()
+
             default:
                 Ghostty.logger.warning("unknown dnd event tag=\(payload.tag.rawValue, privacy: .public)")
             }
+        }
+
+        private static func dndData(
+            _ pointer: UnsafePointer<UInt8>?,
+            count: Int
+        ) -> Data {
+            guard count > 0, let pointer else { return Data() }
+            return Data(bytes: pointer, count: count)
+        }
+
+        private static func dndString(
+            _ pointer: UnsafePointer<UInt8>?,
+            count: Int
+        ) -> String {
+            guard count > 0, let pointer else { return "" }
+            let bytes = UnsafeBufferPointer(start: pointer, count: count)
+            return String(bytes: bytes, encoding: .utf8) ?? ""
         }
 
         static func wakeup(_ userdata: UnsafeMutableRawPointer?) {

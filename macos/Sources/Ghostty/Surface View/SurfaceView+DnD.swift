@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import UniformTypeIdentifiers
 import GhosttyKit
 
@@ -471,5 +472,774 @@ extension Ghostty.SurfaceView {
         }
 
         dndState.reset()
+    }
+}
+
+// MARK: NSDraggingSource
+
+extension Ghostty.SurfaceView {
+    /// Owns the terminal-as-drag-source half of OSC 72
+    final class DragController: NSObject, NSDraggingSource {
+        enum Phase: Equatable {
+            case disabled
+            case awaitingGesture
+            case awaitingOffer
+            case buildingOffer
+            case nativeDrag
+            case finishing
+        }
+
+        struct ImageMetadata {
+            let index: Int32
+            let format: Int32
+            let width: Int32
+            let height: Int32
+            let opacity: Int32
+        }
+
+        enum DragError: String, Error {
+            case EPERM
+            case EINVAL
+            case ETIMEDOUT
+        }
+
+        enum DragImageDecodeResult {
+            case image(NSImage)
+            case invalid
+        }
+
+        enum LazyResult {
+            case pending
+            case data(Data)
+            case failed
+            case timedOut
+        }
+
+        final class LazyRequest {
+            private(set) var result: LazyResult = .pending
+            var sent = false
+
+            func resolve(_ data: Data) {
+                result = .data(data)
+            }
+
+            func fail() {
+                result = .failed
+            }
+
+            func wait(timeout: TimeInterval, while isValid: () -> Bool) -> LazyResult {
+                let deadline = Date().addingTimeInterval(timeout)
+                while case .pending = result {
+                    guard isValid() else {
+                        result = .failed
+                        break
+                    }
+                    guard Date() < deadline else {
+                        result = .timedOut
+                        break
+                    }
+                    _ = RunLoop.current.run(
+                        mode: .default,
+                        before: min(deadline, Date().addingTimeInterval(0.02)))
+                }
+                return result
+            }
+        }
+
+        private final class PasteboardProvider: NSObject, NSPasteboardItemDataProvider {
+            weak var owner: DragController?
+            let generation: UInt
+            let mimeIndex: Int
+
+            init(owner: DragController, generation: UInt, mimeIndex: Int) {
+                self.owner = owner
+                self.generation = generation
+                self.mimeIndex = mimeIndex
+            }
+
+            func pasteboard(
+                _ pasteboard: NSPasteboard?,
+                item: NSPasteboardItem,
+                provideDataForType type: NSPasteboard.PasteboardType
+            ) {
+                owner?.provideData(for: item, type: type, mimeIndex: mimeIndex, generation: generation)
+            }
+        }
+
+        /// Maximum time for clients to fulfill a lazy data request
+        private static let providerTimeout: TimeInterval = 5
+        /// Distance from the bottom of the drag image to the mouse pointer
+        private static let dragImageBottomPadding: CGFloat = 10
+        /// Minimum pointer movement to trigger a drag gesture
+        private static let gestureThreshold: CGFloat = 5
+
+        private weak var surfaceView: Ghostty.SurfaceView?
+        /// Current drag-source lifecycle phase.
+        private(set) var phase: Phase = .disabled
+        /// Bumped per offer so stale lazy completions from a superseded drag are ignored.
+        private(set) var generation: UInt = 0
+        /// True after the client registered this pane as a drag source (`t=o:x=1`).
+        private var registered = false
+        /// Multiplexer session id from the client's registration, or -1 if unset.
+        private var session: Int32 = -1
+        /// True while the mouse button is down on a registered drag source.
+        private var mouseIsDown = false
+        /// Mouse-down event retained until a gesture threshold is crossed.
+        private var mouseDownEvent: NSEvent?
+        /// Last mouse-dragged event used to start the native dragging session.
+        private var dragEvent: NSEvent?
+        /// MIME types offered by the application for the current drag.
+        private var mimes: [String] = []
+        /// Native drag operations allowed by the client's `t=o:o=` flags.
+        private var operationMask: NSDragOperation = []
+        /// Eager `t=p` payload bytes keyed by MIME index.
+        private var preSentData: [Int: Data] = [:]
+        /// Decoded drag images from pre-sent `t=p:x<0` sequences.
+        private var images: [NSImage] = []
+        /// Outstanding lazy data requests keyed by MIME index.
+        private var requests: [Int: LazyRequest] = [:]
+        /// Pasteboard data providers for MIME types without eager data.
+        private var providers: [PasteboardProvider] = []
+        /// AppKit dragging session for the active native drag, if any.
+        private var draggingSession: NSDraggingSession?
+
+        func attach(to surfaceView: Ghostty.SurfaceView) {
+            self.surfaceView = surfaceView
+        }
+
+        func close() {
+            registered = false
+            clearOffer(next: .disabled)
+            surfaceView = nil
+        }
+
+        func reset() {
+            registered = false
+            session = -1
+            clearOffer(next: .disabled)
+        }
+
+        func abort() {
+            switch phase {
+            case .nativeDrag, .finishing:
+                operationMask = []
+                for request in requests.values {
+                    request.fail()
+                }
+                phase = .finishing
+                updateDraggingImage(nil)
+
+            case .awaitingOffer, .buildingOffer:
+                clearOffer(next: registered ? .awaitingGesture : .disabled)
+
+            default:
+                break
+            }
+        }
+
+        func setRegistration(enabled: Bool, session: Int32 = -1) {
+            registered = enabled
+            self.session = enabled ? session : -1
+            clearOffer(next: enabled ? .awaitingGesture : .disabled)
+        }
+
+        func mouseDown(with event: NSEvent) {
+            guard phase == .awaitingGesture else { return }
+            mouseIsDown = true
+            mouseDownEvent = event
+        }
+
+        func mouseUp(with _: NSEvent) {
+            mouseIsDown = false
+            mouseDownEvent = nil
+
+            switch phase {
+            case .awaitingOffer, .buildingOffer:
+                rejectOffer(.EPERM)
+
+            default:
+                break
+            }
+        }
+
+        func mouseDragged(with event: NSEvent) {
+            guard phase == .awaitingGesture, mouseIsDown, let mouseDownEvent,
+                  let surfaceView else { return }
+            guard Self.exceedsGestureThreshold(from: mouseDownEvent, to: event) else {
+                return
+            }
+
+            dragEvent = event
+            phase = .awaitingOffer
+            surfaceView.dndSendPrompt(event: event, session: session)
+        }
+
+        static func exceedsGestureThreshold(from start: NSEvent, to current: NSEvent) -> Bool {
+            let dx = current.locationInWindow.x - start.locationInWindow.x
+            let dy = current.locationInWindow.y - start.locationInWindow.y
+            return dx * dx + dy * dy >= gestureThreshold * gestureThreshold
+        }
+
+        func keyDown(with event: NSEvent) -> Bool {
+            guard event.keyCode == 53 else { return false }
+            switch phase {
+            case .awaitingOffer, .buildingOffer:
+                rejectOffer(.EPERM)
+                return true
+
+            default:
+                return false
+            }
+        }
+
+        func receiveOffer(mimes: String, operations: Int32) {
+            guard phase == .awaitingOffer, mouseIsDown else {
+                rejectOffer(.EPERM)
+                return
+            }
+
+            self.mimes = mimes.split(whereSeparator: \.isWhitespace).map(String.init)
+            generation &+= 1
+            operationMask = Self.dragOperation(for: operations)
+            preSentData = [:]
+            images = []
+            requests = [:]
+            providers = []
+            draggingSession = nil
+            phase = .buildingOffer
+        }
+
+        func receivePreSentData(index: Int32, data: Data) {
+            guard phase == .buildingOffer else {
+                rejectOffer(.EPERM)
+                return
+            }
+
+            let mimeIndex = Int(index)
+            guard mimes.indices.contains(mimeIndex), preSentData[mimeIndex] == nil else {
+                rejectOffer(.EINVAL)
+                return
+            }
+            preSentData[mimeIndex] = data
+        }
+
+        func receivePreSentImage(_ metadata: ImageMetadata, data: Data) {
+            guard phase == .buildingOffer else {
+                rejectOffer(.EPERM)
+                return
+            }
+
+            guard Int(metadata.index) == images.count else {
+                rejectOffer(.EINVAL)
+                return
+            }
+
+            switch decodeDragImage(
+                data: data,
+                format: metadata.format,
+                width: metadata.width,
+                height: metadata.height,
+                opacity: metadata.opacity
+            ) {
+            case .image(let image):
+                images.append(image)
+            case .invalid:
+                rejectOffer(.EINVAL)
+            }
+        }
+
+        func receiveStartDrag() {
+            guard phase == .buildingOffer, mouseIsDown else {
+                rejectOffer(.EPERM)
+                return
+            }
+            startNativeDrag()
+        }
+
+        func receiveImageSelect(index: Int32) {
+            guard phase == .nativeDrag else {
+                rejectOffer(.EINVAL)
+                return
+            }
+
+            let selected = Int(index)
+            updateDraggingImage(images.indices.contains(selected) ? images[selected] : nil)
+        }
+
+        func receiveLazyData(index: Int32, data: Data) {
+            guard phase == .nativeDrag || phase == .finishing else {
+                rejectOffer(.EINVAL)
+                return
+            }
+
+            let mimeIndex = Int(index)
+            guard let request = requests[mimeIndex], request.sent else {
+                abortDrag(.EINVAL)
+                return
+            }
+            request.resolve(data)
+        }
+
+        func receiveError(index: Int32, payload: String) {
+            guard phase == .nativeDrag || phase == .finishing else {
+                rejectOffer(.EINVAL)
+                return
+            }
+            guard let request = requests[Int(index)], request.sent else {
+                abortDrag(.EINVAL)
+                return
+            }
+            request.fail()
+        }
+
+        func receiveCancel() {
+            switch phase {
+            case .nativeDrag, .finishing:
+                operationMask = []
+                for request in requests.values {
+                    request.fail()
+                }
+                phase = .finishing
+                updateDraggingImage(nil)
+
+            case .awaitingOffer, .buildingOffer:
+                clearOffer(next: registered ? .awaitingGesture : .disabled)
+
+            default:
+                break
+            }
+        }
+
+        static func dragOperation(for flags: Int32) -> NSDragOperation {
+            var result: NSDragOperation = []
+            if flags & 1 != 0 { result.insert(.copy) }
+            if flags & 2 != 0 { result.insert(.move) }
+            return result
+        }
+
+        static func operationCode(for operation: NSDragOperation) -> Int32 {
+            var result: Int32 = 0
+            if operation.contains(.copy) { result |= 1 }
+            if operation.contains(.move) { result |= 2 }
+            return result
+        }
+
+        static func localURLs(fromURIList data: Data) -> [URL]? {
+            guard let value = String(data: data, encoding: .utf8) else { return nil }
+            let urls = value
+                .split(whereSeparator: \.isNewline)
+                .compactMap { line -> URL? in
+                    let value = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !value.isEmpty, !value.hasPrefix("#"),
+                          let url = URL(string: value), url.isFileURL,
+                          url.host == nil || url.host == "" || url.host == "localhost" else {
+                        return nil
+                    }
+                    return url
+                }
+            return urls.isEmpty ? nil : urls
+        }
+
+        private func decodeDragImage(
+            data: Data,
+            format: Int32,
+            width: Int32,
+            height: Int32,
+            opacity: Int32
+        ) -> DragImageDecodeResult {
+            if format == 0 {
+                return decodeTextImage(
+                    data: data,
+                    widthUnits: Int(width),
+                    heightUnits: Int(height),
+                    opacity: opacity
+                )
+            }
+
+            let pixelWidth = Int(width)
+            let pixelHeight = Int(height)
+            let samples: Int
+            let hasAlpha: Bool
+            let scale = surfaceView?.window?.backingScaleFactor
+                        ?? NSScreen.main?.backingScaleFactor ?? 1
+
+            switch format {
+            case 24:
+                samples = 3
+                hasAlpha = false
+            case 32:
+                samples = 4
+                hasAlpha = true
+            case 100:
+                guard let rep = NSBitmapImageRep(data: data),
+                      rep.pixelsWide == pixelWidth, rep.pixelsHigh == pixelHeight else { return .invalid }
+                let image = NSImage(
+                    size: NSSize(width: CGFloat(pixelWidth) / scale, height: CGFloat(pixelHeight) / scale)
+                )
+                image.addRepresentation(rep)
+                return .image(image)
+            default:
+                return .invalid
+            }
+
+            let (pixels, pixelOverflow) = pixelWidth.multipliedReportingOverflow(by: pixelHeight)
+            let (expectedBytes, byteOverflow) = pixels.multipliedReportingOverflow(by: samples)
+            guard !pixelOverflow, !byteOverflow else { return .invalid }
+            guard expectedBytes == data.count else { return .invalid }
+            guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+                  let provider = CGDataProvider(data: data as CFData) else { return .invalid }
+
+            let alphaInfo: CGImageAlphaInfo = hasAlpha ? .last : .none
+            guard let cgImage = CGImage(
+                width: pixelWidth,
+                height: pixelHeight,
+                bitsPerComponent: 8,
+                bitsPerPixel: samples * 8,
+                bytesPerRow: pixelWidth * samples,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo(rawValue: alphaInfo.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: true,
+                intent: .defaultIntent
+            ) else { return .invalid }
+
+            let image = NSImage(
+                cgImage: cgImage,
+                size: NSSize(width: CGFloat(pixelWidth) / scale, height: CGFloat(pixelHeight) / scale)
+            )
+            return .image(image)
+        }
+
+        private func decodeTextImage(
+            data: Data,
+            widthUnits: Int,
+            heightUnits: Int,
+            opacity: Int32
+        ) -> DragImageDecodeResult {
+            guard let text = String(data: data, encoding: .utf8), !text.isEmpty else {
+                return .invalid
+            }
+
+            let scale = CGFloat(widthUnits) / CGFloat(heightUnits)
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: dragTextFont(scale: scale),
+                .foregroundColor: NSColor.labelColor,
+            ]
+            let attributed = NSAttributedString(string: text, attributes: attributes)
+            let bounds = attributed.boundingRect(
+                with: NSSize(width: CGFloat.greatestFiniteMagnitude,
+                             height: CGFloat.greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading]
+            )
+
+            let line = CTLineCreateWithAttributedString(attributed)
+            let inkMaxX = CTLineGetImageBounds(line, nil).maxX
+
+            let width = ceil(max(bounds.width, inkMaxX))
+            let height = ceil(bounds.height)
+            guard width.isFinite, height.isFinite, width > 0, height > 0 else {
+                return .invalid
+            }
+
+            let imageSize = NSSize(width: width, height: height + Self.dragImageBottomPadding)
+            let image = NSImage(size: imageSize, flipped: false) { rect in
+                if opacity > 0 {
+                    let alpha = CGFloat(opacity) / 1024.0
+                    NSColor.windowBackgroundColor.withAlphaComponent(alpha).setFill()
+                    rect.fill()
+                }
+                attributed.draw(at: NSPoint(x: 0, y: Self.dragImageBottomPadding))
+                return true
+            }
+            return .image(image)
+        }
+
+        private func dragTextFont(scale: CGFloat) -> NSFont {
+            var font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+            guard let surface = surfaceView?.surface else { return font }
+            if let fontRaw = ghostty_surface_quicklook_font(surface) {
+                let unmanaged = Unmanaged<CTFont>.fromOpaque(fontRaw)
+                font = unmanaged.takeUnretainedValue() as NSFont
+                unmanaged.release()
+            }
+            var descriptor = font.fontDescriptor
+            if let symbolsRaw = ghostty_surface_symbols_font(surface) {
+                let unmanaged = Unmanaged<CTFont>.fromOpaque(symbolsRaw)
+                let symbolsFont = unmanaged.takeUnretainedValue() as NSFont
+                unmanaged.release()
+                descriptor = descriptor.addingAttributes([.cascadeList: [symbolsFont.fontDescriptor]])
+            }
+            return NSFont(descriptor: descriptor, size: font.pointSize * scale) ?? font
+        }
+
+        private func startNativeDrag() {
+            guard let surfaceView,
+                  let event = dragEvent,
+                  let items = buildDraggingItems(at: surfaceView.convert(event.locationInWindow, from: nil)),
+                  !items.isEmpty else {
+                rejectOffer(.EINVAL)
+                return
+            }
+
+            phase = .nativeDrag
+            draggingSession = surfaceView.beginDraggingSession(with: items, event: event, source: self)
+            draggingSession?.animatesToStartingPositionsOnCancelOrFail = true
+
+            surfaceView.dndDragWillBegin(with: event)
+            surfaceView.dndSendStartResult(code: "OK", session: session)
+        }
+
+        private func buildDraggingItems(at point: NSPoint) -> [NSDraggingItem]? {
+            var result: [NSDraggingItem] = []
+            var genericItem: NSPasteboardItem?
+            var genericTypes = Set<NSPasteboard.PasteboardType>()
+
+            for (index, mime) in mimes.enumerated() {
+                if mime == "text/uri-list", let data = preSentData[index],
+                   let urls = Self.localURLs(fromURIList: data) {
+                    for url in urls {
+                        result.append(NSDraggingItem(pasteboardWriter: url as NSURL))
+                    }
+                    continue
+                }
+
+                guard let type = NSPasteboard.PasteboardType(dndMimeType: mime),
+                      genericTypes.insert(type).inserted else { continue }
+                let item = genericItem ?? NSPasteboardItem()
+                genericItem = item
+
+                if let data = preSentData[index] {
+                    guard Self.setRepresentation(data, mime: mime, type: type, on: item) else {
+                        return nil
+                    }
+                } else {
+                    let provider = PasteboardProvider(owner: self, generation: generation, mimeIndex: index)
+                    providers.append(provider)
+                    item.setDataProvider(provider, forTypes: [type])
+                }
+            }
+
+            if let genericItem {
+                result.insert(NSDraggingItem(pasteboardWriter: genericItem), at: 0)
+            }
+            guard !result.isEmpty else { return nil }
+
+            let image = images.first ?? Self.fallbackDragImage
+            for (index, item) in result.enumerated() {
+                Self.applyDragImage(image, to: item, isPrimary: index == 0, anchor: point)
+            }
+            return result
+        }
+
+        private static func setRepresentation(
+            _ data: Data,
+            mime: String,
+            type: NSPasteboard.PasteboardType,
+            on item: NSPasteboardItem
+        ) -> Bool {
+            if mime == "text/plain" {
+                guard let value = String(data: data, encoding: .utf8) else { return false }
+                return item.setString(value, forType: type)
+            }
+
+            return item.setData(data, forType: type)
+        }
+
+        private func provideData(
+            for item: NSPasteboardItem,
+            type: NSPasteboard.PasteboardType,
+            mimeIndex: Int,
+            generation: UInt
+        ) {
+            guard generation == self.generation, phase == .nativeDrag,
+                  mimes.indices.contains(mimeIndex), let surfaceView else { return }
+
+            let request = requests[mimeIndex] ?? LazyRequest()
+            requests[mimeIndex] = request
+            if !request.sent {
+                request.sent = true
+                surfaceView.dndSendDataRequest(index: Int32(mimeIndex), session: session)
+            }
+
+            let result = request.wait(timeout: Self.providerTimeout) {
+                generation == self.generation && (phase == .nativeDrag || phase == .finishing)
+            }
+            if case .data(let data) = result {
+                _ = Self.setRepresentation(data, mime: mimes[mimeIndex], type: type, on: item)
+            } else if case .timedOut = result {
+                request.fail()
+                surfaceView.dndSendOfferError(
+                    index: Int32(mimeIndex),
+                    code: DragError.ETIMEDOUT.rawValue,
+                    session: session)
+            }
+        }
+
+        /// Applies a drag preview to one item. The primary item shows `image`
+        /// anchored at `anchor` when starting a drag, or keeps its frame origin
+        /// when updating an active session. Secondary items are given an empty
+        /// frame to prevent them from showing their own default previews.
+        private static func applyDragImage(
+            _ image: NSImage,
+            to item: NSDraggingItem,
+            isPrimary: Bool,
+            anchor: NSPoint? = nil
+        ) {
+            let frame: NSRect
+            guard isPrimary else {
+                frame = NSRect(origin: .zero, size: NSSize(width: 1, height: 1))
+                item.setDraggingFrame(frame, contents: nil)
+                return
+            }
+            if let anchor {
+                frame = NSRect(origin: anchor, size: image.size)
+            } else {
+                var existing = item.draggingFrame
+                existing.size = image.size
+                frame = existing
+            }
+            item.setDraggingFrame(frame, contents: image)
+        }
+
+        private func updateDraggingImage(_ image: NSImage?) {
+            guard let draggingSession else { return }
+            let content = image ?? Self.transparentDragImage
+            draggingSession.enumerateDraggingItems(
+                options: [],
+                for: nil,
+                classes: [NSPasteboardItem.self, NSURL.self],
+                searchOptions: [:]
+            ) { item, index, stop in
+                Self.applyDragImage(content, to: item, isPrimary: index == 0)
+                if index == 0 {
+                    stop.pointee = true
+                }
+            }
+        }
+
+        private func abortDrag(_ error: DragError) {
+            operationMask = []
+            for request in requests.values {
+                request.fail()
+            }
+            if phase == .nativeDrag {
+                phase = .finishing
+                updateDraggingImage(nil)
+            }
+            surfaceView?.dndSendAbortDrag(code: error.rawValue, session: session)
+            clearOffer(next: registered ? .awaitingGesture : .disabled)
+        }
+
+        private func rejectOffer(_ error: DragError) {
+            surfaceView?.dndSendStartResult(code: error.rawValue, session: session)
+            clearOffer(next: registered ? .awaitingGesture : .disabled)
+        }
+
+        private func clearOffer(next: Phase) {
+            generation &+= 1
+            phase = next
+            mouseIsDown = false
+            mouseDownEvent = nil
+            dragEvent = nil
+            mimes = []
+            operationMask = []
+            preSentData = [:]
+            images = []
+            for request in requests.values {
+                request.fail()
+            }
+            requests = [:]
+            providers = []
+            draggingSession = nil
+        }
+
+        func draggingSession(
+            _ session: NSDraggingSession,
+            sourceOperationMaskFor _: NSDraggingContext
+        ) -> NSDragOperation {
+            if let draggingSession, draggingSession !== session { return [] }
+            guard phase == .nativeDrag else { return [] }
+            return operationMask
+        }
+
+        func draggingSession(
+            _ session: NSDraggingSession,
+            endedAt _: NSPoint,
+            operation: NSDragOperation
+        ) {
+            guard draggingSession === session else { return }
+
+            phase = .finishing
+            let code = Self.operationCode(for: operation)
+            if code != 0 {
+                surfaceView?.dndSendAction(operation: code, session: self.session)
+                surfaceView?.dndSendDropped(session: self.session)
+            }
+            surfaceView?.dndSendFinished(cancelled: code == 0, session: self.session)
+            clearOffer(next: registered ? .awaitingGesture : .disabled)
+        }
+
+        // TODO: This is a placeholder. We should ideally have a better fallback image
+        private static let fallbackDragImage: NSImage = {
+            let size = NSSize(width: 64, height: 48)
+            let image = NSImage(size: size)
+            image.lockFocus()
+            NSColor.controlAccentColor.withAlphaComponent(0.75).setFill()
+            NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: 8, yRadius: 8).fill()
+            image.unlockFocus()
+            return image
+        }()
+
+        private static let transparentDragImage: NSImage = {
+            NSImage(size: NSSize(width: 1, height: 1))
+        }()
+    }
+
+    func dndSendPrompt(event: NSEvent, session: Int32) {
+        guard let surface else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        ghostty_surface_dnd_prompt(surface, session, point.x, frame.height - point.y)
+    }
+
+    func dndSendStartResult(code: String, session: Int32) {
+        guard let surface else { return }
+        code.withCString { code in
+            ghostty_surface_dnd_start_response(surface, session, code, nil)
+        }
+    }
+
+    func dndSendOfferError(index: Int32, code: String, session: Int32) {
+        guard let surface else { return }
+        code.withCString { code in
+            ghostty_surface_dnd_offer_error(surface, session, index, code, nil)
+        }
+    }
+
+    func dndSendAbortDrag(code: String, session: Int32) {
+        guard let surface else { return }
+        code.withCString { code in
+            ghostty_surface_dnd_abort_drag(surface, session, code, nil)
+        }
+    }
+
+    func dndSendAction(operation: Int32, session: Int32) {
+        guard let surface else { return }
+        ghostty_surface_dnd_action_changed(surface, session, operation)
+    }
+
+    func dndSendDropped(session: Int32) {
+        guard let surface else { return }
+        ghostty_surface_dnd_dropped(surface, session)
+    }
+
+    func dndSendFinished(cancelled: Bool, session: Int32) {
+        guard let surface else { return }
+        ghostty_surface_dnd_finished(surface, session, cancelled)
+    }
+
+    func dndSendDataRequest(index: Int32, session: Int32) {
+        guard let surface else { return }
+        ghostty_surface_dnd_request_data(surface, session, index)
     }
 }

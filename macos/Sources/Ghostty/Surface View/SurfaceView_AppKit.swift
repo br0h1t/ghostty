@@ -186,6 +186,7 @@ extension Ghostty {
 
         // Kitty drag-and-drop (OSC 72) state.
         let dndState = DndState()
+        let dndDrag = DragController()
 
         private var markedText: NSMutableAttributedString
         private(set) var focused: Bool = true
@@ -243,6 +244,7 @@ extension Ghostty {
             // is non-zero so that our layer bounds are non-zero so that our renderer
             // can do SOMETHING.
             super.init(id: uuid, frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+            dndDrag.attach(to: self)
 
             // Our cache of screen data
             cachedScreenContents = .init(duration: .milliseconds(500)) { [weak self] in
@@ -392,6 +394,8 @@ extension Ghostty {
         }
 
         deinit {
+            dndDrag.close()
+
             // Remove all of our notificationcenter subscriptions
             let center = NotificationCenter.default
             center.removeObserver(self)
@@ -883,11 +887,15 @@ extension Ghostty {
 
         override func mouseDown(with event: NSEvent) {
             guard let surface = self.surface else { return }
+            suppressNextLeftMouseUp = false
             let mods = Ghostty.ghosttyMods(event.modifierFlags)
             ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, mods)
+            dndDrag.mouseDown(with: event)
         }
 
         override func mouseUp(with event: NSEvent) {
+            dndDrag.mouseUp(with: event)
+
             // If this mouse-up corresponds to a focus-only click transfer,
             // suppress it so we don't emit a release without a press.
             if suppressNextLeftMouseUp {
@@ -904,6 +912,17 @@ extension Ghostty {
             ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, mods)
 
             // Release pressure
+            ghostty_surface_mouse_pressure(surface, 0, 0)
+        }
+
+        /// AppKit consumes the mouse-up that completes a native drag. Balance
+        /// the press already sent to the terminal and suppress a release if
+        /// AppKit also delivers one to this view.
+        func dndDragWillBegin(with event: NSEvent) {
+            guard let surface else { return }
+            suppressNextLeftMouseUp = true
+            let mods = Ghostty.ghosttyMods(event.modifierFlags)
+            ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT, mods)
             ghostty_surface_mouse_pressure(surface, 0, 0)
         }
 
@@ -1026,6 +1045,7 @@ extension Ghostty {
 
         override func mouseDragged(with event: NSEvent) {
             self.mouseMoved(with: event)
+            dndDrag.mouseDragged(with: event)
         }
 
         override func rightMouseDragged(with event: NSEvent) {
@@ -1080,6 +1100,8 @@ extension Ghostty {
         }
 
         override func keyDown(with event: NSEvent) {
+            if dndDrag.keyDown(with: event) { return }
+
             guard let surface = self.surface else {
                 self.interpretKeyEvents([event])
                 return
